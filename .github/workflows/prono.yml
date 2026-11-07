@@ -19,6 +19,7 @@ jobs:
       - name: Prono
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           python3 -c "import requests" 2>/dev/null || pip install -q requests

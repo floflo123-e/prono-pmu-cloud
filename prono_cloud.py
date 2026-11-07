@@ -208,11 +208,11 @@ def partants(d, r, c, all_=False):
     return ps if all_ else [p for p in ps if p.get("statut") == "PARTANT" and p.get("dernierRapportDirect")]
 
 
-def races(d, lo_min, hi_min):
+def races(d, lo_min, hi_min, all_countries=False):
     prog = (get(f"{PMU}/{fmt(d)}") or {}).get("programme", {})
     t = now()
     for reunion in prog.get("reunions", []):
-        if reunion.get("pays", {}).get("code") != "FRA":
+        if not all_countries and reunion.get("pays", {}).get("code") != "FRA":
             continue
         for course in reunion.get("courses", []):
             st = start_of(course)
@@ -387,6 +387,82 @@ def step_quinte(d, quinte, model):
     return "pas de quinte dans la fenetre"
 
 
+def norm(x):
+    import unicodedata
+    x = unicodedata.normalize("NFD", str(x).lower())
+    return "".join(ch for ch in x if ch.isalnum() or ch == " ")
+
+
+def programme_chat(d, question):
+    """Toutes les courses (tous pays) des 5 prochaines heures, en compact,
+    + le detail complet des courses citees (RxCy, ou hippodrome et/ou heure ; fautes de frappe tolerees)."""
+    import difflib
+    import re
+    q = norm(question)
+    mots = [w for w in q.split() if len(w) >= 4]
+    rc = {(int(a), int(b)) for a, b in re.findall(r"r\s*(\d+)\s*c\s*(\d+)", q)}
+    heures = {f"{int(h):02d}:{m}" for h, m in re.findall(r"(\d{1,2})\s*[h:]\s*(\d{2})", question.lower())}
+    liste, scored = [], []
+    for reunion, course in races(d, -30, 300, all_countries=True):
+        r, c = reunion["numOfficiel"], course["numOrdre"]
+        hippo = reunion["hippodrome"]["libelleCourt"]
+        dep = start_of(course).strftime("%H:%M")
+        liste.append(f"R{r}C{c} {hippo} ({reunion.get('pays', {}).get('code')}) {dep} {course.get('discipline', '')}")
+        h_hit = any(difflib.get_close_matches(w, mots, n=1, cutoff=0.8) for w in norm(hippo).split() if len(w) >= 4)
+        score = 3 * ((r, c) in rc) + 2 * (dep in heures) + h_hit
+        if score >= 2 or (h_hit and not heures and not rc):
+            scored.append((-score, course["heureDepart"], r, c, hippo, dep, reunion, course))
+    detail = []
+    for _, _, r, c, hippo, dep, reunion, course in sorted(scored, key=lambda x: x[:2])[:2]:
+        ps = partants(d, r, c, all_=True)
+        detail.append({
+            "course": f"R{r}C{c}", "hippodrome": hippo, "pays": reunion.get("pays", {}).get("code"),
+            "depart": dep, "nom": course.get("libelle"), "discipline": course.get("discipline"),
+            "distance_m": course.get("distance"),
+            "places_payees": nb_places(len([p for p in ps if p.get("statut") == "PARTANT"])),
+            "chevaux": [{"num": p["numPmu"], "nom": p["nom"], "statut": p.get("statut"),
+                         "cote": (p.get("dernierRapportDirect") or p.get("dernierRapportReference") or {}).get("rapport"),
+                         "musique": p.get("musique"), "jockey": p.get("driver"),
+                         "entraineur": p.get("entraineur")} for p in ps],
+        })
+    return liste, detail
+
+
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODELS = ("gemini-flash-latest", "gemini-2.5-flash")
+
+
+def gemini_search(question, convo):
+    """Gemini fait la recherche internet (Google Search) et renvoie un resume court a Claude."""
+    if not GEMINI_KEY:
+        return None
+    body = {
+        "contents": [{"parts": [{"text":
+            f"Nous sommes le {now().strftime('%d/%m/%Y %H:%M')} (heure de Paris). Cherche sur internet les infos utiles "
+            "pour répondre à cette question d'un parieur PMU (courses hippiques) : pronostics de la presse, "
+            "partants, non-partants, cotes, forme des chevaux, résultats et arrivées officielles si la course est passée. "
+            "Réponds en français, 12 lignes maximum, faits seulement, avec la source (site) pour chaque info. "
+            "Si tu ne trouves rien de fiable, dis-le.\n\n"
+            f"Conversation :\n{convo[-1500:]}\n\nQuestion : {question}"}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"maxOutputTokens": 700, "temperature": 0.2},
+    }
+    for model in GEMINI_MODELS:
+        try:
+            r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                              headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=60)
+            if r.status_code != 200:
+                print(f"gemini {model}: {r.status_code} {r.text[:200]}")
+                continue
+            parts = r.json()["candidates"][0]["content"]["parts"]
+            text = "".join(p.get("text", "") for p in parts).strip()
+            if text:
+                return text[:2500]
+        except Exception as e:  # Gemini en panne : Claude repond quand meme
+            print(f"gemini {model}: {e}")
+    return None
+
+
 def step_chat(d, bets, quinte, chat):
     answered = {m.get("reply_to") for m in chat if m.get("kind") == "chat_a"}
     pending = [m for m in chat if m.get("kind") == "chat_q" and m.get("id") not in answered]
@@ -394,16 +470,24 @@ def step_chat(d, bets, quinte, chat):
         return "aucun message"
     history = [m for m in chat if m.get("time", 0) > now().timestamp() - 6 * 3600][-16:]
     convo = "\n".join(("Utilisateur : " if m["kind"] == "chat_q" else "Claude : ") + m.get("text", "") for m in history)
+    question = pending[-1].get("text", "")
+    liste, detail = programme_chat(d, question)
+    web = gemini_search(question, convo)
     ctx = {
         "heure": now().strftime("%H:%M"),
+        "programme_5h_tous_pays": liste,
+        "courses_citees_detail": detail,
         "paris_conseilles_aujourdhui": [{k: b.get(k) for k in ("course", "hippodrome", "depart", "num", "cheval", "type_label",
                                                                  "probabilite", "statut", "pourquoi")} for b in bets.values()],
         "quinte": quinte,
-        "courses_a_venir_3h": candidates(d, 5, 180, max_races=10),
+        "favoris_solides_fr_3h": candidates(d, 5, 180, max_races=6),
     }
-    prompt = (f"Contexte du jour (données PMU en direct) :\n{json.dumps(ctx, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    web_txt = (f"\n\nRecherche internet faite par Gemini (Google Search), à vérifier, peut contenir des erreurs :\n{web}"
+               if web else "")
+    prompt = (f"Contexte du jour (données PMU en direct) :\n{json.dumps(ctx, ensure_ascii=False, separators=(',', ':'))}{web_txt}\n\n"
               f"Conversation récente :\n{convo}\n\nRéponds au dernier message de l'utilisateur. Si tu conseilles un pari, "
-              "indique toujours le type de jeu, la course (RxCy, hippodrome, heure) et le cheval (numéro + nom).")
+              "indique toujours le type de jeu, la course (RxCy, hippodrome, heure) et le cheval (numéro + nom). "
+              "Les données PMU priment sur la recherche internet en cas de désaccord ; dis-le si une info vient d'internet.")
     text = ask(prompt, system=SYSTEM_CHAT, as_json=False)
     last = pending[-1]
     publish("chat_a", "💬 Claude : " + text[:80], {"reply_to": last["id"], "text": text[:3500],
