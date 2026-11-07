@@ -264,7 +264,7 @@ Musique : chiffre = place (0 = au-delà de 9), lettre = discipline (a attelé, m
 
 {data}
 
-Règles : choisis le pari qui maximise la probabilité de finir gagnant avec un retour d'au moins {target:.2f} € pour {stake:.0f} €.
+Règles : choisis TOUJOURS le cheval qui a le plus de chances d'être payé (probabilité la plus haute), le pari qui maximise la probabilité de finir gagnant avec un retour d'au moins {target:.2f} € pour {stake:.0f} €.
 Méfie-toi du trot (D récents), des obstacles (T), des courses à moins de 8 partants (2 placés seulement), des musiques irrégulières, des cotes qui montent fort.
 Si AUCUN cheval ne te paraît assez sûr, réponds {{"jouer": false, "pourquoi": "..."}}.
 Sinon réponds UNIQUEMENT :
@@ -274,10 +274,8 @@ Sinon réponds UNIQUEMENT :
 
 
 def step_bet(d, bets):
-    if not (9 <= now().hour < 23):
+    if not (8 <= now().hour < 23):
         return "hors horaires"
-    if any(b["statut"] == "en_attente" for b in bets.values()):
-        return "un pari est deja en cours"
     if len([b for b in bets.values() if b["statut"] != "annule"]) >= MAX_BETS_PER_DAY:
         return "maximum du jour atteint"
     cands = candidates(d, *WINDOW)
@@ -286,6 +284,9 @@ def step_bet(d, bets):
     solid = [c for c in solid if f"{d.isoformat()}-{c['course']}" not in {b["id"].rsplit("-", 1)[0] for b in bets.values()}]
     if not solid:
         return "aucun cheval assez solide dans la fenetre"
+    # France uniquement (races() filtre deja FRA), et toujours les chevaux les plus surs en premier
+    solid.sort(key=lambda c: -max(h.get("p_place", 0) for h in c["chevaux"]))
+    solid = solid[:4]
     adv = ask(PROMPT_BET.format(stake=STAKE, target=STAKE * 1.1, heure=now().strftime("%H:%M"),
                                 lo=WINDOW[0], hi=WINDOW[1], data=json.dumps(solid, ensure_ascii=False, separators=(",", ":"))))
     if not adv.get("jouer"):
