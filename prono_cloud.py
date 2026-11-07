@@ -1,0 +1,435 @@
+"""Prono PMU - version cloud (GitHub Actions), fonctionne PC eteint.
+
+Toutes les 10 min (9h-23h, heure de Paris) :
+  - resultats des paris conseilles deja courus ;
+  - si une course avec un cheval tres solide part dans 25 a 55 min, Claude donne le pari final
+    (la notification sert de rappel "30 min avant") ;
+  - Quinte+ : avis de Claude 25 a 55 min avant le depart ;
+  - chat : repond aux messages envoyes depuis l'appli.
+L'etat est relu depuis le canal ntfy (aucun fichier a sauvegarder).
+
+Variables d'environnement : NTFY_TOPIC (secret), CLAUDE_CODE_OAUTH_TOKEN (secret).
+Usage : python prono_cloud.py [tick|chat|candidates]
+"""
+from __future__ import annotations
+import datetime as dt
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from zoneinfo import ZoneInfo
+
+import requests
+
+TZ = ZoneInfo("Europe/Paris")
+PMU = "https://online.turfinfo.api.pmu.fr/rest/client/1/programme"
+NTFY = "https://ntfy.sh"
+TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
+STAKE = 5.0
+TAKE_PLACE = 0.18
+MIN_RAPPORT = 1.10
+MIN_P_PLACE = 0.70          # on ne derange Claude que pour un cheval vraiment solide
+WINDOW = (25, 55)           # minutes avant le depart
+MAX_BETS_PER_DAY = 6
+SYSTEM = "Tu es Claude, le conseiller hippique personnel de l'utilisateur dans son appli Prono PMU. Réponds uniquement en JSON."
+SYSTEM_CHAT = ("Tu es Claude, le conseiller hippique personnel de l'utilisateur dans son appli Prono PMU. "
+               "Réponds en français simple, tutoiement, phrases courtes, sans markdown lourd. Sois honnête : "
+               "aucun pari n'est sûr, rappelle-le quand c'est utile, sans faire la morale à chaque message.")
+
+S = requests.Session()
+S.headers["User-Agent"] = "Mozilla/5.0 prono-pmu-cloud/1.0 usage-personnel"
+
+
+def now():
+    return dt.datetime.now(TZ)
+
+
+def get(url):
+    for i in range(3):
+        try:
+            time.sleep(0.2)
+            r = S.get(url, timeout=30)
+            if r.status_code in (204, 404):
+                return None
+            if r.status_code == 200:
+                return r.json()
+        except (requests.RequestException, ValueError):
+            pass
+        time.sleep(2 * (i + 1))
+    return None
+
+
+def fmt(d):
+    return d.strftime("%d%m%Y")
+
+
+def start_of(course):
+    return dt.datetime.fromtimestamp(course["heureDepart"] / 1000, TZ)
+
+
+def nb_places(n):
+    return 3 if n >= 8 else (2 if n >= 4 else 0)
+
+
+# ------------------------------------------------------------------ ntfy (etat + publication)
+def read_channel():
+    r = S.get(f"{NTFY}/{TOPIC}/json", params={"poll": "1", "since": "all"}, timeout=30)
+    out = []
+    for line in r.text.splitlines():
+        try:
+            m = json.loads(line)
+            if m.get("event") == "message":
+                m["body"] = json.loads(m.get("message") or "{}")
+                out.append(m)
+        except ValueError:
+            continue
+    return sorted(out, key=lambda m: m["time"])
+
+
+def state():
+    """Reconstitue l'etat du jour a partir des messages du canal."""
+    today = now().date().isoformat()
+    bets, quinte, chat, model = {}, None, [], None
+    for m in read_channel():
+        b = m["body"]
+        k = b.get("kind")
+        if k == "bet":
+            bets[b["bet"]["id"]] = b["bet"]
+        elif k == "result" and b.get("bet_id") in bets:
+            bets[b["bet_id"]].update(statut=b["statut"])
+        elif k == "cancel" and b.get("bet_id") in bets:
+            bets[b["bet_id"]]["statut"] = "annule"
+        elif k == "quinte" and b["quinte"].get("date") == today:
+            quinte = b["quinte"]
+        elif k == "model" and b.get("date") == today:
+            model = b
+        elif k in ("chat_q", "chat_a"):
+            chat.append({**b, "time": m["time"]})
+    todays = {k: v for k, v in bets.items() if v.get("date") == today}
+    return todays, quinte, chat, model
+
+
+def publish(kind, title, payload, priority=3):
+    body = json.dumps({"kind": kind, **payload}, ensure_ascii=False, separators=(",", ":"))
+    if len(body.encode()) > 4000:
+        raise ValueError("message trop long")
+    title = " ".join(title.split())[:200]
+    r = S.post(f"{NTFY}/{TOPIC}", data=body.encode(),
+               headers={"Title": title.encode(), "Priority": str(priority), "Tags": "horse"}, timeout=30)
+    r.raise_for_status()
+
+
+# ------------------------------------------------------------------ Claude
+def claude_bin():
+    if shutil.which("claude"):
+        return "claude"
+    subprocess.run(["npm", "install", "-g", "--silent", "@anthropic-ai/claude-code"], check=True)
+    return "claude"
+
+
+def ask(prompt, system=SYSTEM, as_json=True):
+    out = subprocess.run([claude_bin(), "-p", "--output-format", "json", "--tools", "", "--system-prompt", system],
+                         input=prompt, capture_output=True, text=True, timeout=300)
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr[-400:] or out.stdout[-400:])
+    text = json.loads(out.stdout).get("result", "")
+    if not as_json:
+        return text.strip()
+    a, b = text.find("{"), text.rfind("}")
+    return json.loads(text[a:b + 1])
+
+
+# ------------------------------------------------------------------ calculs de marche
+def market_probs(ps):
+    q = {p["numPmu"]: (1 / p["dernierRapportDirect"]["rapport"]) ** 0.85 for p in ps}
+    s = sum(q.values())
+    return {k: v / s for k, v in q.items()}
+
+
+def place_distribution(q, k):
+    out, nums = [], list(q)
+
+    def rec(chosen, prob, rest):
+        if len(chosen) == k:
+            out.append((tuple(chosen), prob))
+            return
+        for n in nums:
+            if n not in chosen:
+                rec(chosen + [n], prob * q[n] / rest, rest - q[n])
+
+    rec([], 1.0, 1.0)
+    return out
+
+
+def place_pool(d, r, c):
+    j = get(f"{PMU}/{fmt(d)}/R{r}/C{c}/combinaisons?specialisation=INTERNET")
+    for comb in (j or {}).get("combinaisons", []):
+        if comb["pariType"] == "E_SIMPLE_PLACE":
+            return {x["combinaison"][0]: x["totalEnjeu"] for x in comb["listeCombinaisons"]}
+    return {}
+
+
+def evaluate(d, r, c, ps):
+    k = nb_places(len(ps))
+    if not k:
+        return k, {}
+    q = market_probs(ps)
+    dist = place_distribution(q, k)
+    pool = place_pool(d, r, c)
+    total = sum(pool.values())
+    cotes = {p["numPmu"]: p["dernierRapportDirect"]["rapport"] for p in ps}
+    res = {}
+    for n in q:
+        p_place = sum(p for s, p in dist if n in s)
+        rapports = []
+        if pool.get(n):
+            net = total * (1 - TAKE_PLACE)
+            rapports = [(max(MIN_RAPPORT, 1 + (net - sum(pool.get(x, 0) for x in s)) / (k * pool[n])), p)
+                        for s, p in dist if n in s]
+        if rapports:
+            w = sum(p for _, p in rapports)
+            mean = sum(r_ * p for r_, p in rapports) / w
+            lo = min(r_ for r_, _ in rapports)
+            sig = [r_ for r_, p in rapports if p / w > 0.02]
+            hi = max(sig) if sig else mean
+        else:
+            mean = max(MIN_RAPPORT, 1 + (cotes[n] - 1) * 0.3)
+            lo, hi = MIN_RAPPORT, mean * 1.3
+        res[n] = {"p_place": round(p_place, 3), "rapport_min": round(lo, 2),
+                  "rapport_moyen": round(mean, 2), "rapport_max": round(hi, 2)}
+    return k, res
+
+
+def partants(d, r, c, all_=False):
+    j = get(f"{PMU}/{fmt(d)}/R{r}/C{c}/participants") or {}
+    ps = j.get("participants", [])
+    return ps if all_ else [p for p in ps if p.get("statut") == "PARTANT" and p.get("dernierRapportDirect")]
+
+
+def races(d, lo_min, hi_min):
+    prog = (get(f"{PMU}/{fmt(d)}") or {}).get("programme", {})
+    t = now()
+    for reunion in prog.get("reunions", []):
+        if reunion.get("pays", {}).get("code") != "FRA":
+            continue
+        for course in reunion.get("courses", []):
+            st = start_of(course)
+            if t + dt.timedelta(minutes=lo_min) <= st <= t + dt.timedelta(minutes=hi_min):
+                yield reunion, course
+
+
+def candidates(d, lo_min, hi_min, max_races=8):
+    found = []
+    for reunion, course in races(d, lo_min, hi_min):
+        if not any(p.get("typePari") in ("E_SIMPLE_PLACE", "SIMPLE_PLACE") for p in course.get("paris", [])):
+            continue
+        r, c = reunion["numOfficiel"], course["numOrdre"]
+        ps = partants(d, r, c)
+        if len(ps) < 4:
+            continue
+        found.append((min(p["dernierRapportDirect"]["rapport"] for p in ps), reunion, course, ps))
+    found.sort(key=lambda x: x[0])
+    out = []
+    for _, reunion, course, ps in found[:max_races]:
+        r, c = reunion["numOfficiel"], course["numOrdre"]
+        k, ev = evaluate(d, r, c, ps)
+        if not k:
+            continue
+        top = sorted(ps, key=lambda p: p["dernierRapportDirect"]["rapport"])[:4]
+        out.append({
+            "course": f"R{r}C{c}", "r": r, "c": c, "nom": course.get("libelle"),
+            "hippodrome": reunion["hippodrome"]["libelleCourt"], "depart": start_of(course).strftime("%H:%M"),
+            "depart_ts": course["heureDepart"], "discipline": course.get("discipline"),
+            "distance_m": course.get("distance"), "partants": len(ps), "chevaux_payes_en_place": k,
+            "terrain": (course.get("penetrometre") or {}).get("intitule"),
+            "chevaux": [{"num": p["numPmu"], "nom": p["nom"], "cote": p["dernierRapportDirect"]["rapport"],
+                         "tendance_cote_pct": p["dernierRapportDirect"].get("nombreIndicateurTendance"),
+                         "musique": p.get("musique"), "jockey_driver": p.get("driver"),
+                         "entraineur": p.get("entraineur"), **ev.get(p["numPmu"], {})} for p in top],
+        })
+    return out
+
+
+# ------------------------------------------------------------------ etapes
+PROMPT_BET = """L'utilisateur veut miser {stake:.0f} € sur UN SEUL pari, gain visé d'environ +10 %, avec le plus de certitude possible.
+Il recevra ton conseil maintenant, environ 30 minutes avant le départ : c'est le pari final, il va le jouer.
+
+Données PMU en direct ({heure}). Courses qui partent dans {lo} à {hi} min, 4 favoris chacune :
+- p_place : probabilité estimée d'être payé en placé (prudente),
+- rapport_min / moyen / max : rapport placé estimé pour 1 € d'après les enjeux déjà joués.
+Musique : chiffre = place (0 = au-delà de 9), lettre = discipline (a attelé, m monté, p plat, h haies, s steeple), D = disqualifié, T = tombé, A = arrêté, (25) = année.
+
+{data}
+
+Règles : choisis le pari qui maximise la probabilité de finir gagnant avec un retour d'au moins {target:.2f} € pour {stake:.0f} €.
+Méfie-toi du trot (D récents), des obstacles (T), des courses à moins de 8 partants (2 placés seulement), des musiques irrégulières, des cotes qui montent fort.
+Si AUCUN cheval ne te paraît assez sûr, réponds {{"jouer": false, "pourquoi": "..."}}.
+Sinon réponds UNIQUEMENT :
+{{"jouer": true, "course": "R?C?", "num": <numéro>, "type_pari": "SIMPLE_PLACE", "probabilite": <0-1>,
+ "retour_min": <euros pour la mise>, "retour_max": <euros>, "pourquoi": "<2 à 4 phrases, tutoiement>",
+ "risques": "<1 à 2 phrases>", "plan_b": "<RxCy n°N NOM si non-partant>"}}"""
+
+
+def step_bet(d, bets):
+    if not (9 <= now().hour < 23):
+        return "hors horaires"
+    if any(b["statut"] == "en_attente" for b in bets.values()):
+        return "un pari est deja en cours"
+    if len([b for b in bets.values() if b["statut"] != "annule"]) >= MAX_BETS_PER_DAY:
+        return "maximum du jour atteint"
+    cands = candidates(d, *WINDOW)
+    solid = [c for c in cands if any(h.get("p_place", 0) >= MIN_P_PLACE and h.get("rapport_moyen", 0) >= 1.10
+                                     for h in c["chevaux"])]
+    solid = [c for c in solid if f"{d.isoformat()}-{c['course']}" not in {b["id"].rsplit("-", 1)[0] for b in bets.values()}]
+    if not solid:
+        return "aucun cheval assez solide dans la fenetre"
+    adv = ask(PROMPT_BET.format(stake=STAKE, target=STAKE * 1.1, heure=now().strftime("%H:%M"),
+                                lo=WINDOW[0], hi=WINDOW[1], data=json.dumps(solid, ensure_ascii=False, separators=(",", ":"))))
+    if not adv.get("jouer"):
+        return f"Claude passe son tour : {adv.get('pourquoi', '')[:120]}"
+    race = next((c for c in solid if c["course"] == adv.get("course")), None)
+    horse = next((h for h in (race or {}).get("chevaux", []) if h["num"] == adv.get("num")), None)
+    if not horse:
+        return f"choix invalide de Claude : {adv}"
+    t = now()
+    bet = {
+        "id": f"{d.isoformat()}-{race['course']}-{horse['num']}", "date": d.isoformat(),
+        "course": race["course"], "r": race["r"], "c": race["c"], "nom_course": race["nom"],
+        "hippodrome": race["hippodrome"], "depart": race["depart"], "depart_ts": race["depart_ts"],
+        "discipline": race["discipline"], "partants": race["partants"],
+        "places_payees": race["chevaux_payes_en_place"], "num": horse["num"], "cheval": horse["nom"],
+        "cote": horse["cote"], "type_pari": "SIMPLE_PLACE", "type_label": "Simple placé", "mise": STAKE,
+        "probabilite": round(float(adv.get("probabilite") or horse["p_place"]), 2),
+        "retour_min": round(float(adv.get("retour_min") or horse["rapport_min"] * STAKE), 2),
+        "retour_max": round(float(adv.get("retour_max") or horse["rapport_max"] * STAKE), 2),
+        "pourquoi": adv.get("pourquoi", ""), "risques": adv.get("risques", ""), "plan_b": adv.get("plan_b", ""),
+        "source": "claude", "statut": "en_attente", "cree_le": t.isoformat(timespec="minutes"),
+        "cree_ts": int(t.timestamp() * 1000), "final": True,
+    }
+    mins = int((race["depart_ts"] / 1000 - t.timestamp()) // 60)
+    publish("bet", f"⏰ Départ dans {mins} min · SIMPLE PLACÉ n°{bet['num']} {bet['cheval']} · {bet['course']} {bet['hippodrome']} {bet['depart']}",
+            {"bet": bet}, priority=5)
+    return f"pari publie : {bet['id']}"
+
+
+def step_results(d, bets):
+    log = []
+    for b in bets.values():
+        if b["statut"] != "en_attente" or now().timestamp() < b["depart_ts"] / 1000 + 8 * 60:
+            continue
+        j = get(f"{PMU}/{fmt(d)}/R{b['r']}/C{b['c']}/rapports-definitifs")
+        if not j:
+            continue
+        rapport = None
+        for p in j:
+            if p["typePari"] in ("E_SIMPLE_PLACE", "SIMPLE_PLACE"):
+                for r in p.get("rapports", []):
+                    if str(b["num"]) in r["combinaison"].split("-"):
+                        rapport = r["dividendePourUnEuro"] / 100
+                if rapport:
+                    break
+        ps = partants(d, b["r"], b["c"], all_=True)
+        me = next((p for p in ps if p["numPmu"] == b["num"]), {})
+        arrivee = [p["numPmu"] for p in sorted((p for p in ps if p.get("ordreArrivee")), key=lambda p: p["ordreArrivee"])[:5]]
+        if me.get("statut") == "NON_PARTANT":
+            retour, verdict = b["mise"], "rembourse"
+        elif rapport:
+            retour, verdict = round(rapport * b["mise"], 2), "gagne"
+        else:
+            retour, verdict = 0.0, "perdu"
+        gain = round(retour - b["mise"], 2)
+        emoji = {"gagne": "✅", "perdu": "❌", "rembourse": "↩️"}[verdict]
+        publish("result", f"{emoji} {b['cheval']} : {verdict} ({gain:+.2f} €)",
+                {"bet_id": b["id"], "statut": verdict, "retour": retour, "gain": gain, "rapport": rapport,
+                 "place": me.get("ordreArrivee"), "arrivee": arrivee}, priority=4)
+        b["statut"] = verdict
+        log.append(f"resultat {b['id']} : {verdict}")
+    return log
+
+
+PROMPT_QUINTE = """Voici le Quinté+ du jour, qui part dans environ {mins} minutes (données PMU en direct, {heure}).
+{model}
+Partants : numéro, nom, cote, musique, jockey/driver, entraîneur, gains de carrière, nb courses / victoires / places.
+{data}
+
+Donne TON pronostic final de 5 chevaux (ordre de préférence). Français simple, tutoiement, honnête sur l'incertitude.
+Réponds UNIQUEMENT avec : {{"selection": [n1,n2,n3,n4,n5], "base": <n>, "outsider": <n>, "pourquoi": "<3 à 5 phrases>", "confiance": "<faible|moyenne|bonne>"}}"""
+
+
+def step_quinte(d, quinte, model):
+    if quinte:
+        return "quinte deja conseille"
+    for reunion, course in races(d, *WINDOW):
+        if not any(p.get("typePari") in ("QUINTE_PLUS", "E_QUINTE_PLUS") for p in course.get("paris", [])):
+            continue
+        r, c = reunion["numOfficiel"], course["numOrdre"]
+        ps = partants(d, r, c)
+        data = [{"num": p["numPmu"], "nom": p["nom"], "cote": p["dernierRapportDirect"]["rapport"],
+                 "musique": p.get("musique"), "jockey_driver": p.get("driver"), "entraineur": p.get("entraineur"),
+                 "gains": (p.get("gainsParticipant") or {}).get("gainsCarriere"), "courses": p.get("nombreCourses"),
+                 "victoires": p.get("nombreVictoires"), "places": p.get("nombrePlaces")} for p in ps]
+        mtxt = ("Analyse statistique du logiciel de l'utilisateur (calculée sur son Chromebook) : "
+                + json.dumps(model.get("resume"), ensure_ascii=False)) if model else ""
+        mins = int((course["heureDepart"] / 1000 - now().timestamp()) // 60)
+        adv = ask(PROMPT_QUINTE.format(mins=mins, heure=now().strftime("%H:%M"), model=mtxt,
+                                       data=json.dumps(data, ensure_ascii=False, separators=(",", ":"))))
+        t = now()
+        q = {"date": d.isoformat(), "nom": course.get("libelle"), "hippodrome": reunion["hippodrome"]["libelleCourt"],
+             "course": f"R{r}C{c}", "depart": start_of(course).strftime("%H:%M"), "depart_ts": course["heureDepart"],
+             "selection": adv.get("selection"), "base": adv.get("base"), "outsider": adv.get("outsider"),
+             "pourquoi": adv.get("pourquoi"), "confiance": adv.get("confiance"),
+             "modele": (model or {}).get("pronostics"), "maj_le": t.strftime("%H:%M"), "cree_ts": int(t.timestamp() * 1000)}
+        sel = "-".join(str(x) for x in q["selection"] or [])
+        publish("quinte", f"⏰ Quinté+ dans {mins} min · {sel} · {q['course']} {q['hippodrome']} {q['depart']}", {"quinte": q}, priority=5)
+        return f"quinte publie : {sel}"
+    return "pas de quinte dans la fenetre"
+
+
+def step_chat(d, bets, quinte, chat):
+    answered = {m.get("reply_to") for m in chat if m.get("kind") == "chat_a"}
+    pending = [m for m in chat if m.get("kind") == "chat_q" and m.get("id") not in answered]
+    if not pending:
+        return "aucun message"
+    history = [m for m in chat if m.get("time", 0) > now().timestamp() - 6 * 3600][-16:]
+    convo = "\n".join(("Utilisateur : " if m["kind"] == "chat_q" else "Claude : ") + m.get("text", "") for m in history)
+    ctx = {
+        "heure": now().strftime("%H:%M"),
+        "paris_conseilles_aujourdhui": [{k: b.get(k) for k in ("course", "hippodrome", "depart", "num", "cheval", "type_label",
+                                                                 "probabilite", "statut", "pourquoi")} for b in bets.values()],
+        "quinte": quinte,
+        "courses_a_venir_3h": candidates(d, 5, 180, max_races=10),
+    }
+    prompt = (f"Contexte du jour (données PMU en direct) :\n{json.dumps(ctx, ensure_ascii=False, separators=(',', ':'))}\n\n"
+              f"Conversation récente :\n{convo}\n\nRéponds au dernier message de l'utilisateur. Si tu conseilles un pari, "
+              "indique toujours le type de jeu, la course (RxCy, hippodrome, heure) et le cheval (numéro + nom).")
+    text = ask(prompt, system=SYSTEM_CHAT, as_json=False)
+    last = pending[-1]
+    publish("chat_a", "💬 Claude : " + text[:80], {"reply_to": last["id"], "text": text[:3500],
+                                                   "ts": int(now().timestamp() * 1000)}, priority=4)
+    return "reponse envoyee"
+
+
+def main(mode):
+    if not TOPIC:
+        sys.exit("NTFY_TOPIC manquant")
+    d = now().date()
+    if mode == "candidates":
+        print(json.dumps(candidates(d, 5, 360), ensure_ascii=False, indent=1))
+        return
+    bets, quinte, chat, model = state()
+    log = []
+    for name, fn in (("chat", lambda: step_chat(d, bets, quinte, chat)),
+                     ("resultats", lambda: step_results(d, bets)),
+                     ("pari", lambda: step_bet(d, bets) if mode == "tick" else "-"),
+                     ("quinte", lambda: step_quinte(d, quinte, model) if mode == "tick" else "-")):
+        try:
+            log.append(f"{name}: {fn()}")
+        except Exception as e:  # une etape en echec ne bloque pas les autres
+            log.append(f"{name}: ERREUR {e}")
+    print("\n".join(log))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1] if len(sys.argv) > 1 else "tick")

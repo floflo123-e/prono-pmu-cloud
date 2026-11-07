@@ -1,0 +1,16 @@
+name: keepalive
+# GitHub coupe les taches planifiees d'un depot public apres 60 jours sans activite : un commit vide par mois l'evite.
+on:
+  schedule:
+    - cron: "0 6 1 * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          git config user.name "prono-bot"; git config user.email "prono-bot@users.noreply.github.com"
+          git commit --allow-empty -m "keepalive $(date +%F)" && git push
