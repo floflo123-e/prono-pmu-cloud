@@ -430,38 +430,55 @@ def programme_chat(d, question):
 
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODELS = ("gemini-3.8-flash", "gemini-flash-latest")  # recherche Google : offre payante chez Google
+GEMINI_MODELS = ("gemini-3.8-flash", "gemini-3.5-flash", "gemini-flash-latest", "gemini-flash-lite-latest")
 
 
-def gemini_search(question, convo):
-    """Gemini fait la recherche internet (Google Search) et renvoie un resume court a Claude."""
+def day_lines(day, with_arrival=False):
+    """Programme compact d'un autre jour (tous pays)."""
+    prog = (get(f"{PMU}/{fmt(day)}") or {}).get("programme", {})
+    out = []
+    for reunion in prog.get("reunions", []):
+        for course in reunion.get("courses", []):
+            quinte = any("QUINTE" in p.get("typePari", "") for p in course.get("paris", []))
+            arr = "-".join(str(x[0]) for x in (course.get("ordreArrivee") or [])[:5]) if with_arrival else ""
+            out.append(f"R{reunion['numOfficiel']}C{course['numOrdre']} {reunion['hippodrome']['libelleCourt']} "
+                       f"({reunion.get('pays', {}).get('code')}) {start_of(course).strftime('%H:%M')} {course.get('discipline', '')}"
+                       f" {course.get('nombreDeclaresPartants', '')}p" + (" QUINTE+" if quinte else "") + (f" arrivee {arr}" if arr else ""))
+    return out
+
+
+def other_days(d, question):
+    q = norm(question)
+    days = {}
+    if "apres demain" in q or "apresdemain" in q:
+        days["apres_demain"] = (d + dt.timedelta(days=2), False)
+    elif "demain" in q:
+        days["demain"] = (d + dt.timedelta(days=1), False)
+    if "hier" in q:
+        days["hier"] = (d - dt.timedelta(days=1), True)
+    return {k: day_lines(v[0], v[1]) for k, v in days.items()}
+
+
+def gemini_chat(system, prompt):
     if not GEMINI_KEY:
-        return None
-    body = {
-        "contents": [{"parts": [{"text":
-            f"Nous sommes le {now().strftime('%d/%m/%Y %H:%M')} (heure de Paris). Cherche sur internet les infos utiles "
-            "pour répondre à cette question d'un parieur PMU (courses hippiques) : pronostics de la presse, "
-            "partants, non-partants, cotes, forme des chevaux, résultats et arrivées officielles si la course est passée. "
-            "Réponds en français, 12 lignes maximum, faits seulement, avec la source (site) pour chaque info. "
-            "Si tu ne trouves rien de fiable, dis-le.\n\n"
-            f"Conversation :\n{convo[-1500:]}\n\nQuestion : {question}"}]}],
-        "tools": [{"google_search": {}}],
-        "generationConfig": {"maxOutputTokens": 700, "temperature": 0.2},
-    }
+        raise RuntimeError("pas de cle Gemini")
+    body = {"system_instruction": {"parts": [{"text": system}]},
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": 1500, "temperature": 0.4}}
+    err = ""
     for model in GEMINI_MODELS:
         try:
             r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                              headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=60)
-            if r.status_code != 200:
-                print(f"gemini {model}: {r.status_code} {r.text[:200]}")
-                continue
-            parts = r.json()["candidates"][0]["content"]["parts"]
-            text = "".join(p.get("text", "") for p in parts).strip()
-            if text:
-                return text[:2500]
-        except Exception as e:  # Gemini en panne : Claude repond quand meme
-            print(f"gemini {model}: {e}")
-    return None
+                              headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=90)
+            if r.status_code == 200:
+                parts = r.json()["candidates"][0]["content"]["parts"]
+                text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+                if text:
+                    return text
+            err = f"{model} {r.status_code}"
+        except Exception as e:
+            err = f"{model} {e}"
+    raise RuntimeError(err)
 
 
 def step_chat(d, bets, quinte, chat):
@@ -469,33 +486,51 @@ def step_chat(d, bets, quinte, chat):
     pending = [m for m in chat if m.get("kind") == "chat_q" and m.get("id") not in answered]
     if not pending:
         return "aucun message"
-    history = [m for m in chat if m.get("time", 0) > now().timestamp() - 6 * 3600][-16:]
-    convo = "\n".join(("Utilisateur : " if m["kind"] == "chat_q" else "Claude : ") + m.get("text", "") for m in history)
-    question = pending[-1].get("text", "")
+    last = pending[-1]
+    ai = last.get("ai") or "claude"
+    who = lambda m: "Utilisateur" if m["kind"] == "chat_q" else ("Gemini" if m.get("ai") == "gemini" else "Claude")
+    history = [m for m in chat if m.get("time", 0) > now().timestamp() - 12 * 3600][-24:]
+    lines = [f"{who(m)} : {m.get('text', '')}" for m in history]
+    # ntfy ne garde que 12 h : l'appli joint les derniers messages qu'elle a en memoire
+    earlier = [f"{'Utilisateur' if h.get('u') else h.get('ai', 'Claude').capitalize()} : {h.get('t', '')}"
+               for h in (last.get("hist") or [])]
+    if len(history) <= len(pending) and earlier:
+        lines = earlier + lines
+    convo = "\n".join(lines)
+    question = last.get("text", "")
     liste, detail = programme_chat(d, question)
-    web = gemini_search(question, convo)
     ctx = {
-        "heure": now().strftime("%H:%M"),
+        "date": d.isoformat(), "heure": now().strftime("%H:%M"),
         "programme_5h_tous_pays": liste,
         "courses_citees_detail": detail,
         "paris_conseilles_aujourdhui": [{k: b.get(k) for k in ("course", "hippodrome", "depart", "num", "cheval", "type_label",
                                                                  "probabilite", "statut", "pourquoi")} for b in bets.values()],
         "quinte": quinte,
         "favoris_solides_fr_3h": candidates(d, 5, 180, max_races=6),
+        **{f"programme_{k}": v for k, v in other_days(d, question).items()},
     }
-    web_txt = (f"\n\nRecherche internet faite par Gemini (Google Search), à vérifier, peut contenir des erreurs :\n{web}"
-               if web else "")
-    prompt = (f"Contexte du jour (données PMU en direct) :\n{json.dumps(ctx, ensure_ascii=False, separators=(',', ':'))}{web_txt}\n\n"
-              f"Conversation récente :\n{convo}\n\nRéponds au dernier message de l'utilisateur. Si tu conseilles un pari, "
-              "indique toujours le type de jeu, la course (RxCy, hippodrome, heure) et le cheval (numéro + nom). "
-              "Les données PMU priment sur la recherche internet en cas de désaccord ; dis-le si une info vient d'internet.")
-    text = ask(prompt, system=SYSTEM_CHAT + (" Tu as l'outil WebSearch : si les données PMU ne suffisent pas "
-               "(pronostics presse, non-partants, résultats, courses étrangères), fais 1 à 2 recherches maximum, "
-               "puis cite brièvement la source."), as_json=False, tools="WebSearch")
-    last = pending[-1]
-    publish("chat_a", "💬 Claude : " + text[:80], {"reply_to": last["id"], "text": text[:3500],
-                                                   "ts": int(now().timestamp() * 1000)}, priority=4)
-    return "reponse envoyee"
+    me = "Gemini" if ai == "gemini" else "Claude"
+    prompt = (f"Contexte (données PMU en direct) :\n{json.dumps(ctx, ensure_ascii=False, separators=(',', ':'))}\n\n"
+              f"Conversation (l'utilisateur alterne entre Claude et Gemini : c'est UNE seule conversation, "
+              f"reprends-la naturellement, même les réponses de l'autre IA) :\n{convo}\n\n"
+              f"Tu es {me}. Réponds au dernier message de l'utilisateur. Si tu conseilles un pari, "
+              "indique toujours le type de jeu, la course (RxCy, hippodrome, heure) et le cheval (numéro + nom).")
+    system = SYSTEM_CHAT.replace("Tu es Claude", f"Tu es {me}")
+    text = None
+    if ai == "gemini":
+        try:
+            text = gemini_chat(system, prompt)
+        except Exception as e:
+            print(f"gemini: {e}")
+            ai = "claude"
+            prompt = prompt.replace("Tu es Gemini.", "Tu es Claude (Gemini est indisponible, dis-le en une courte phrase).")
+    if text is None:
+        text = ask(prompt, system=SYSTEM_CHAT + (" Tu as l'outil WebSearch : si les données PMU ne suffisent pas "
+                   "(pronostics presse, non-partants, résultats, courses étrangères), fais 1 à 2 recherches maximum, "
+                   "puis cite brièvement la source. Les données PMU priment sur internet."), as_json=False, tools="WebSearch")
+    publish("chat_a", f"💬 {'Gemini' if ai == 'gemini' else 'Claude'} : " + text[:80],
+            {"reply_to": last["id"], "text": text[:3500], "ai": ai, "ts": int(now().timestamp() * 1000)}, priority=4)
+    return f"reponse envoyee ({ai})"
 
 
 def main(mode):
