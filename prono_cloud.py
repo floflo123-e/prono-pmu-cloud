@@ -129,8 +129,9 @@ def claude_bin():
     return "claude"
 
 
-def ask(prompt, system=SYSTEM, as_json=True):
-    out = subprocess.run([claude_bin(), "-p", "--output-format", "json", "--tools", "", "--system-prompt", system],
+def ask(prompt, system=SYSTEM, as_json=True, tools=""):
+    extra = ["--allowedTools", tools, "--max-turns", "6"] if tools else []
+    out = subprocess.run([claude_bin(), "-p", "--output-format", "json", "--tools", tools, *extra, "--system-prompt", system],
                          input=prompt, capture_output=True, text=True, timeout=300)
     if out.returncode != 0:
         raise RuntimeError(out.stderr[-400:] or out.stdout[-400:])
@@ -429,7 +430,7 @@ def programme_chat(d, question):
 
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODELS = ("gemini-flash-latest", "gemini-2.5-flash")
+GEMINI_MODELS = ("gemini-3.8-flash", "gemini-flash-latest")  # recherche Google : offre payante chez Google
 
 
 def gemini_search(question, convo):
@@ -488,7 +489,9 @@ def step_chat(d, bets, quinte, chat):
               f"Conversation récente :\n{convo}\n\nRéponds au dernier message de l'utilisateur. Si tu conseilles un pari, "
               "indique toujours le type de jeu, la course (RxCy, hippodrome, heure) et le cheval (numéro + nom). "
               "Les données PMU priment sur la recherche internet en cas de désaccord ; dis-le si une info vient d'internet.")
-    text = ask(prompt, system=SYSTEM_CHAT, as_json=False)
+    text = ask(prompt, system=SYSTEM_CHAT + (" Tu as l'outil WebSearch : si les données PMU ne suffisent pas "
+               "(pronostics presse, non-partants, résultats, courses étrangères), fais 1 à 2 recherches maximum, "
+               "puis cite brièvement la source."), as_json=False, tools="WebSearch")
     last = pending[-1]
     publish("chat_a", "💬 Claude : " + text[:80], {"reply_to": last["id"], "text": text[:3500],
                                                    "ts": int(now().timestamp() * 1000)}, priority=4)
