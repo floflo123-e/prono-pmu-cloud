@@ -74,8 +74,8 @@ def nb_places(n):
 
 
 # ------------------------------------------------------------------ ntfy (etat + publication)
-def read_channel():
-    r = S.get(f"{NTFY}/{TOPIC}/json", params={"poll": "1", "since": "all"}, timeout=30)
+def read_channel(topic=None):
+    r = S.get(f"{NTFY}/{topic or TOPIC}/json", params={"poll": "1", "since": "all"}, timeout=30)
     out = []
     for line in r.text.splitlines():
         try:
@@ -92,6 +92,7 @@ def state():
     """Reconstitue l'etat du jour a partir des messages du canal."""
     today = now().date().isoformat()
     bets, quinte, chat, model = {}, None, [], None
+    boxes = set()
     for m in read_channel():
         b = m["body"]
         k = b.get("kind")
@@ -107,16 +108,18 @@ def state():
             model = b
         elif k in ("chat_q", "chat_a"):
             chat.append({**b, "time": m["time"]})
+        elif k == "chat_ping" and str(b.get("box", "")).isalnum() and 8 <= len(str(b.get("box", ""))) <= 32:
+            boxes.add(b["box"])
     todays = {k: v for k, v in bets.items() if v.get("date") == today}
-    return todays, quinte, chat, model
+    return todays, quinte, chat, model, boxes
 
 
-def publish(kind, title, payload, priority=3):
+def publish(kind, title, payload, priority=3, topic=None):
     body = json.dumps({"kind": kind, **payload}, ensure_ascii=False, separators=(",", ":"))
     if len(body.encode()) > 4000:
         raise ValueError("message trop long")
     title = " ".join(title.split())[:200]
-    r = S.post(f"{NTFY}/{TOPIC}", data=body.encode(),
+    r = S.post(f"{NTFY}/{topic or TOPIC}", data=body.encode(),
                headers={"Title": title.encode(), "Priority": str(priority), "Tags": "horse"}, timeout=30)
     r.raise_for_status()
 
@@ -482,7 +485,22 @@ def gemini_chat(system, prompt):
     raise RuntimeError(err)
 
 
-def step_chat(d, bets, quinte, chat):
+def chat_topic(box):
+    return f"{TOPIC}-c-{box}"
+
+
+def step_chats(d, bets, quinte, chat, boxes):
+    """Chaque compte a son canal de chat prive ; l'ancien chat commun reste gere pour les vieilles versions."""
+    log = [step_chat(d, bets, quinte, chat)]
+    for box in sorted(boxes):
+        topic = chat_topic(box)
+        msgs = [{**m["body"], "time": m["time"]} for m in read_channel(topic)
+                if m["body"].get("kind") in ("chat_q", "chat_a")]
+        log.append(f"{box[:4]}…: {step_chat(d, bets, quinte, msgs, topic)}")
+    return " | ".join(log)
+
+
+def step_chat(d, bets, quinte, chat, topic=None):
     answered = {m.get("reply_to") for m in chat if m.get("kind") == "chat_a"}
     pending = [m for m in chat if m.get("kind") == "chat_q" and m.get("id") not in answered]
     if not pending:
@@ -530,7 +548,7 @@ def step_chat(d, bets, quinte, chat):
                    "(pronostics presse, non-partants, résultats, courses étrangères), fais 1 à 2 recherches maximum, "
                    "puis cite brièvement la source. Les données PMU priment sur internet."), as_json=False, tools="WebSearch")
     publish("chat_a", f"💬 {'Gemini' if ai == 'gemini' else 'Claude'} : " + text[:80],
-            {"reply_to": last["id"], "text": text[:3500], "ai": ai, "ts": int(now().timestamp() * 1000)}, priority=4)
+            {"reply_to": last["id"], "text": text[:3500], "ai": ai, "ts": int(now().timestamp() * 1000)}, priority=4, topic=topic)
     return f"reponse envoyee ({ai})"
 
 
@@ -541,9 +559,9 @@ def main(mode):
     if mode == "candidates":
         print(json.dumps(candidates(d, 5, 360), ensure_ascii=False, indent=1))
         return
-    bets, quinte, chat, model = state()
+    bets, quinte, chat, model, boxes = state()
     log = []
-    for name, fn in (("chat", lambda: step_chat(d, bets, quinte, chat)),
+    for name, fn in (("chat", lambda: step_chats(d, bets, quinte, chat, boxes)),
                      ("resultats", lambda: step_results(d, bets)),
                      ("pari", lambda: step_bet(d, bets) if mode == "tick" else "-"),
                      ("quinte", lambda: step_quinte(d, quinte, model) if mode == "tick" else "-")):
