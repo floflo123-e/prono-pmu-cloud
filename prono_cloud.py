@@ -27,12 +27,14 @@ TZ = ZoneInfo("Europe/Paris")
 PMU = "https://online.turfinfo.api.pmu.fr/rest/client/1/programme"
 NTFY = "https://ntfy.sh"
 TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
-STAKE = 5.0
+STAKE = 2.0                 # 2 EUR par cheval
 TAKE_PLACE = 0.18
 MIN_RAPPORT = 1.10
-MIN_P_PLACE = 0.70          # on ne derange Claude que pour un cheval vraiment solide
-WINDOW = (25, 55)           # minutes avant le depart
-MAX_BETS_PER_DAY = 6
+HORSES_PER_RACE = 4         # 4 chevaux en simple place par course
+RACES_PER_DAY = 3           # 3 courses chaque apres-midi
+AFTERNOON = (13, 20)        # departs entre 13h et 20h (heure de Paris)
+PLAN_FROM_HOUR = 11         # choix des 3 courses a partir de 11h
+WINDOW = (25, 44)           # conseil final 25-44 min avant le depart (1 seul rappel cote appli)
 SYSTEM = "Tu es Claude, le conseiller hippique personnel de l'utilisateur dans son appli Prono PMU. Réponds uniquement en JSON."
 SYSTEM_CHAT = ("Tu es Claude, le conseiller hippique personnel de l'utilisateur dans son appli Prono PMU. "
                "Réponds en français simple, tutoiement, phrases courtes, sans markdown lourd. Sois honnête : "
@@ -91,7 +93,7 @@ def read_channel(topic=None):
 def state():
     """Reconstitue l'etat du jour a partir des messages du canal."""
     today = now().date().isoformat()
-    bets, quinte, chat, model = {}, None, [], None
+    bets, quinte, chat, model, plan = {}, None, [], None, []
     boxes = set()
     for m in read_channel():
         b = m["body"]
@@ -106,12 +108,14 @@ def state():
             quinte = b["quinte"]
         elif k == "model" and b.get("date") == today:
             model = b
+        elif k == "plan" and b.get("date") == today:
+            plan = b.get("courses", [])
         elif k in ("chat_q", "chat_a"):
             chat.append({**b, "time": m["time"]})
         elif k == "chat_ping" and str(b.get("box", "")).isalnum() and 8 <= len(str(b.get("box", ""))) <= 32:
             boxes.add(b["box"])
     todays = {k: v for k, v in bets.items() if v.get("date") == today}
-    return todays, quinte, chat, model, boxes
+    return todays, quinte, chat, model, boxes, plan
 
 
 def publish(kind, title, payload, priority=3, topic=None):
@@ -209,7 +213,8 @@ def evaluate(d, r, c, ps):
 def partants(d, r, c, all_=False):
     j = get(f"{PMU}/{fmt(d)}/R{r}/C{c}/participants") or {}
     ps = j.get("participants", [])
-    return ps if all_ else [p for p in ps if p.get("statut") == "PARTANT" and p.get("dernierRapportDirect")]
+    return ps if all_ else [p for p in ps if p.get("statut") == "PARTANT"
+                            and (p.get("dernierRapportDirect") or {}).get("rapport", 0) > 0]
 
 
 def races(d, lo_min, hi_min, all_countries=False):
@@ -224,103 +229,175 @@ def races(d, lo_min, hi_min, all_countries=False):
                 yield reunion, course
 
 
-def candidates(d, lo_min, hi_min, max_races=8):
+def race_info(d, reunion, course, ps, top=4):
+    r, c = reunion["numOfficiel"], course["numOrdre"]
+    k, ev = evaluate(d, r, c, ps)
+    if not k:
+        return None
+    best = sorted(ps, key=lambda p: p["dernierRapportDirect"]["rapport"])[:top]
+    return {
+        "course": f"R{r}C{c}", "r": r, "c": c, "nom": course.get("libelle"),
+        "hippodrome": reunion["hippodrome"]["libelleCourt"], "depart": start_of(course).strftime("%H:%M"),
+        "depart_ts": course["heureDepart"], "discipline": course.get("discipline"),
+        "distance_m": course.get("distance"), "partants": len(ps), "chevaux_payes_en_place": k,
+        "terrain": (course.get("penetrometre") or {}).get("intitule"),
+        "chevaux": [{"num": p["numPmu"], "nom": p["nom"], "cote": p["dernierRapportDirect"]["rapport"],
+                     "tendance_cote_pct": p["dernierRapportDirect"].get("nombreIndicateurTendance"),
+                     "musique": p.get("musique"), "jockey_driver": p.get("driver"),
+                     "entraineur": p.get("entraineur"), **ev.get(p["numPmu"], {})} for p in best],
+    }
+
+
+def has_place(course):
+    return any(p.get("typePari") in ("E_SIMPLE_PLACE", "SIMPLE_PLACE") for p in course.get("paris", []))
+
+
+def candidates(d, lo_min, hi_min, max_races=8, top=4):
     found = []
     for reunion, course in races(d, lo_min, hi_min):
-        if not any(p.get("typePari") in ("E_SIMPLE_PLACE", "SIMPLE_PLACE") for p in course.get("paris", [])):
+        if not has_place(course):
             continue
-        r, c = reunion["numOfficiel"], course["numOrdre"]
-        ps = partants(d, r, c)
+        ps = partants(d, reunion["numOfficiel"], course["numOrdre"])
         if len(ps) < 4:
             continue
         found.append((min(p["dernierRapportDirect"]["rapport"] for p in ps), reunion, course, ps))
     found.sort(key=lambda x: x[0])
     out = []
     for _, reunion, course, ps in found[:max_races]:
-        r, c = reunion["numOfficiel"], course["numOrdre"]
-        k, ev = evaluate(d, r, c, ps)
-        if not k:
-            continue
-        top = sorted(ps, key=lambda p: p["dernierRapportDirect"]["rapport"])[:4]
-        out.append({
-            "course": f"R{r}C{c}", "r": r, "c": c, "nom": course.get("libelle"),
-            "hippodrome": reunion["hippodrome"]["libelleCourt"], "depart": start_of(course).strftime("%H:%M"),
-            "depart_ts": course["heureDepart"], "discipline": course.get("discipline"),
-            "distance_m": course.get("distance"), "partants": len(ps), "chevaux_payes_en_place": k,
-            "terrain": (course.get("penetrometre") or {}).get("intitule"),
-            "chevaux": [{"num": p["numPmu"], "nom": p["nom"], "cote": p["dernierRapportDirect"]["rapport"],
-                         "tendance_cote_pct": p["dernierRapportDirect"].get("nombreIndicateurTendance"),
-                         "musique": p.get("musique"), "jockey_driver": p.get("driver"),
-                         "entraineur": p.get("entraineur"), **ev.get(p["numPmu"], {})} for p in top],
-        })
+        try:
+            info = race_info(d, reunion, course, ps, top)
+        except Exception:
+            info = None
+        if info:
+            out.append(info)
     return out
 
 
-# ------------------------------------------------------------------ etapes
-PROMPT_BET = """L'utilisateur veut miser {stake:.0f} € sur UN SEUL pari, gain visé d'environ +10 %, avec le plus de certitude possible.
-Il recevra ton conseil maintenant, environ 30 minutes avant le départ : c'est le pari final, il va le jouer.
+def score4(race):
+    """Nombre moyen de chevaux payes parmi les 4 plus surs (max 3)."""
+    ps = sorted((h.get("p_place", 0) for h in race["chevaux"]), reverse=True)[:HORSES_PER_RACE]
+    return round(sum(ps), 3)
 
-Données PMU en direct ({heure}). Courses qui partent dans {lo} à {hi} min, 4 favoris chacune :
+
+# ------------------------------------------------------------------ etapes
+PROMPT_BET = """L'utilisateur joue {n} chevaux en SIMPLE PLACÉ dans cette course, {stake:.0f} € chacun ({total:.0f} € au total).
+Il recevra ton conseil maintenant, environ 30 minutes avant le départ : c'est le pari final, il va le jouer.
+Objectif : le maximum de chevaux payés (3 places payées, donc au mieux 3 chevaux sur 4 gagnants).
+
+Données PMU en direct ({heure}), les {top} favoris :
 - p_place : probabilité estimée d'être payé en placé (prudente),
 - rapport_min / moyen / max : rapport placé estimé pour 1 € d'après les enjeux déjà joués.
 Musique : chiffre = place (0 = au-delà de 9), lettre = discipline (a attelé, m monté, p plat, h haies, s steeple), D = disqualifié, T = tombé, A = arrêté, (25) = année.
 
 {data}
 
-Règles : choisis TOUJOURS le cheval qui a le plus de chances d'être payé (probabilité la plus haute), le pari qui maximise la probabilité de finir gagnant avec un retour d'au moins {target:.2f} € pour {stake:.0f} €.
-Méfie-toi du trot (D récents), des obstacles (T), des courses à moins de 8 partants (2 placés seulement), des musiques irrégulières, des cotes qui montent fort.
-Si AUCUN cheval ne te paraît assez sûr, réponds {{"jouer": false, "pourquoi": "..."}}.
-Sinon réponds UNIQUEMENT :
-{{"jouer": true, "course": "R?C?", "num": <numéro>, "type_pari": "SIMPLE_PLACE", "probabilite": <0-1>,
- "retour_min": <euros pour la mise>, "retour_max": <euros>, "pourquoi": "<2 à 4 phrases, tutoiement>",
- "risques": "<1 à 2 phrases>", "plan_b": "<RxCy n°N NOM si non-partant>"}}"""
+Choisis exactement {n} chevaux DIFFÉRENTS parmi ceux-ci : ceux qui ont le plus de chances d'être payés.
+Méfie-toi du trot (D récents), des obstacles (T), des musiques irrégulières, des cotes qui montent fort.
+Réponds UNIQUEMENT :
+{{"chevaux": [{{"num": <numéro>, "probabilite": <0-1>, "pourquoi": "<1 à 2 phrases, tutoiement>"}}, ...{n} fois],
+ "pourquoi": "<2 à 3 phrases sur la course>", "risques": "<1 à 2 phrases>"}}"""
 
 
-def step_bet(d, bets):
-    if not (8 <= now().hour < 23):
-        return "hors horaires"
-    if len([b for b in bets.values() if b["statut"] != "annule"]) >= MAX_BETS_PER_DAY:
-        return "maximum du jour atteint"
-    cands = candidates(d, *WINDOW)
-    solid = [c for c in cands if any(h.get("p_place", 0) >= MIN_P_PLACE and h.get("rapport_moyen", 0) >= 1.10
-                                     for h in c["chevaux"])]
-    solid = [c for c in solid if f"{d.isoformat()}-{c['course']}" not in {b["id"].rsplit("-", 1)[0] for b in bets.values()}]
-    if not solid:
-        return "aucun cheval assez solide dans la fenetre"
-    # France uniquement (races() filtre deja FRA), et toujours les chevaux les plus surs en premier
-    solid.sort(key=lambda c: -max(h.get("p_place", 0) for h in c["chevaux"]))
-    solid = solid[:4]
-    adv = ask(PROMPT_BET.format(stake=STAKE, target=STAKE * 1.1, heure=now().strftime("%H:%M"),
-                                lo=WINDOW[0], hi=WINDOW[1], data=json.dumps(solid, ensure_ascii=False, separators=(",", ":"))))
-    if not adv.get("jouer"):
-        return f"Claude passe son tour : {adv.get('pourquoi', '')[:120]}"
-    race = next((c for c in solid if c["course"] == adv.get("course")), None)
-    horse = next((h for h in (race or {}).get("chevaux", []) if h["num"] == adv.get("num")), None)
-    if not horse:
-        return f"choix invalide de Claude : {adv}"
+def minutes_until(hour):
     t = now()
-    bet = {
-        "id": f"{d.isoformat()}-{race['course']}-{horse['num']}", "date": d.isoformat(),
-        "course": race["course"], "r": race["r"], "c": race["c"], "nom_course": race["nom"],
-        "hippodrome": race["hippodrome"], "depart": race["depart"], "depart_ts": race["depart_ts"],
-        "discipline": race["discipline"], "partants": race["partants"],
-        "places_payees": race["chevaux_payes_en_place"], "num": horse["num"], "cheval": horse["nom"],
-        "cote": horse["cote"], "type_pari": "SIMPLE_PLACE", "type_label": "Simple placé", "mise": STAKE,
-        "probabilite": round(float(adv.get("probabilite") or horse["p_place"]), 2),
-        "retour_min": round(float(adv.get("retour_min") or horse["rapport_min"] * STAKE), 2),
-        "retour_max": round(float(adv.get("retour_max") or horse["rapport_max"] * STAKE), 2),
-        "pourquoi": adv.get("pourquoi", ""), "risques": adv.get("risques", ""), "plan_b": adv.get("plan_b", ""),
-        "source": "claude", "statut": "en_attente", "cree_le": t.isoformat(timespec="minutes"),
-        "cree_ts": int(t.timestamp() * 1000), "final": True,
-    }
-    mins = int((race["depart_ts"] / 1000 - t.timestamp()) // 60)
-    publish("bet", f"⏰ Départ dans {mins} min · SIMPLE PLACÉ n°{bet['num']} {bet['cheval']} · {bet['course']} {bet['hippodrome']} {bet['depart']}",
-            {"bet": bet}, priority=5)
-    return f"pari publie : {bet['id']}"
+    return (t.replace(hour=hour, minute=0, second=0, microsecond=0) - t).total_seconds() / 60
+
+
+def step_plan(d, plan, bets):
+    """Vers 11h : choisit les 3 courses de l'apres-midi ou 4 favoris ont le plus de chances d'etre payes."""
+    if len(plan) >= RACES_PER_DAY or not (PLAN_FROM_HOUR <= now().hour < AFTERNOON[1]):
+        return f"plan : {', '.join(p['course'] + ' ' + p['depart'] for p in plan) or '-'}"
+    lo, hi = max(WINDOW[0], minutes_until(AFTERNOON[0])), minutes_until(AFTERNOON[1])
+    if hi <= lo:
+        return "plus de course cet apres-midi"
+    taken = {p["course"] for p in plan} | {b["course"] for b in bets.values()}
+    races_ = [c for c in candidates(d, lo, hi, max_races=60, top=HORSES_PER_RACE)
+              if c["chevaux_payes_en_place"] == 3 and c["course"] not in taken]
+    races_.sort(key=lambda c: -score4(c))
+    add = [{"course": c["course"], "r": c["r"], "c": c["c"], "hippodrome": c["hippodrome"],
+            "depart": c["depart"], "depart_ts": c["depart_ts"], "score": score4(c)}
+           for c in races_[:RACES_PER_DAY - len(plan)]]
+    if not add:
+        return "aucune course de 8 partants ou plus cet apres-midi"
+    plan[:] = sorted(plan + add, key=lambda p: p["depart_ts"])
+    publish("plan", "Courses de l'après-midi choisies", {"date": d.isoformat(), "courses": plan, "silent": True}, priority=1)
+    return f"plan publie : {', '.join(p['course'] + ' ' + p['depart'] for p in plan)}"
+
+
+def find_race(d, r, c):
+    prog = (get(f"{PMU}/{fmt(d)}") or {}).get("programme", {})
+    for reunion in prog.get("reunions", []):
+        if reunion["numOfficiel"] == r:
+            for course in reunion.get("courses", []):
+                if course["numOrdre"] == c:
+                    return reunion, course
+    return None, None
+
+
+def step_bet(d, bets, plan):
+    t = now()
+    done = {b["course"] for b in bets.values() if b["statut"] != "annule"}
+    due = [p for p in plan if p["course"] not in done
+           and WINDOW[0] * 60 <= p["depart_ts"] / 1000 - t.timestamp() <= WINDOW[1] * 60]
+    if not due:
+        return "aucune course prevue dans la fenetre"
+    log = []
+    for p in due:
+        reunion, course = find_race(d, p["r"], p["c"])
+        ps = partants(d, p["r"], p["c"]) if course else []
+        race = race_info(d, reunion, course, ps, top=HORSES_PER_RACE + 2) if len(ps) >= HORSES_PER_RACE else None
+        if not race:
+            log.append(f"{p['course']} : donnees indisponibles")
+            continue
+        by_num = {h["num"]: h for h in race["chevaux"]}
+        try:
+            adv = ask(PROMPT_BET.format(n=HORSES_PER_RACE, stake=STAKE, total=STAKE * HORSES_PER_RACE,
+                                        heure=t.strftime("%H:%M"), top=len(race["chevaux"]),
+                                        data=json.dumps(race, ensure_ascii=False, separators=(",", ":"))))
+        except Exception as e:
+            adv = {"pourquoi": "", "risques": "", "chevaux": [], "erreur": str(e)[:100]}
+        picks, seen = [], set()
+        for x in adv.get("chevaux", []):
+            n = x.get("num")
+            if n in by_num and n not in seen:
+                picks.append((by_num[n], x)); seen.add(n)
+        # complete avec les plus surs si Claude a mal repondu
+        for h in sorted(race["chevaux"], key=lambda h: -h.get("p_place", 0)):
+            if len(picks) >= HORSES_PER_RACE:
+                break
+            if h["num"] not in seen:
+                picks.append((h, {})); seen.add(h["num"])
+        picks = picks[:HORSES_PER_RACE]
+        picks.sort(key=lambda hx: -float(hx[1].get("probabilite") or hx[0].get("p_place", 0)))
+        mins = int((race["depart_ts"] / 1000 - t.timestamp()) // 60)
+        nums = " · ".join(f"n°{h['num']} {h['nom']}" for h, _ in picks)
+        for i, (h, x) in enumerate(picks):
+            bet = {
+                "id": f"{d.isoformat()}-{race['course']}-{h['num']}", "date": d.isoformat(),
+                "groupe": f"{d.isoformat()}-{race['course']}",
+                "course": race["course"], "r": race["r"], "c": race["c"], "nom_course": race["nom"],
+                "hippodrome": race["hippodrome"], "depart": race["depart"], "depart_ts": race["depart_ts"],
+                "discipline": race["discipline"], "partants": race["partants"],
+                "places_payees": race["chevaux_payes_en_place"], "num": h["num"], "cheval": h["nom"],
+                "cote": h["cote"], "type_pari": "SIMPLE_PLACE", "type_label": "Simple placé", "mise": STAKE,
+                "probabilite": round(float(x.get("probabilite") or h.get("p_place", 0)), 2),
+                "retour_min": round(h.get("rapport_min", 1.1) * STAKE, 2),
+                "retour_max": round(h.get("rapport_max", 1.3) * STAKE, 2),
+                "pourquoi": (x.get("pourquoi") or "") + (" " + adv.get("pourquoi", "") if i == 0 else ""),
+                "risques": adv.get("risques", ""),
+                "plan_b": f"Avec lui dans cette course : {nums}",
+                "source": "claude" if x else "modele", "statut": "en_attente",
+                "cree_le": t.isoformat(timespec="minutes"), "cree_ts": int(t.timestamp() * 1000), "final": True,
+            }
+            title = (f"⏰ Départ dans {mins} min · {race['course']} {race['hippodrome']} {race['depart']} · "
+                     f"4 × SIMPLE PLACÉ {STAKE:.0f} € : " + ", ".join(str(hh["num"]) for hh, _ in picks))
+            publish("bet", title, {"bet": bet, **({"silent": True} if i else {})}, priority=5 if i == 0 else 1)
+        log.append(f"{race['course']} : 4 places publies ({nums})")
+    return "; ".join(log)
 
 
 def step_results(d, bets):
-    log = []
+    log, ready = [], {}
     for b in bets.values():
         if b["statut"] != "en_attente" or now().timestamp() < b["depart_ts"] / 1000 + 8 * 60:
             continue
@@ -344,13 +421,22 @@ def step_results(d, bets):
             retour, verdict = round(rapport * b["mise"], 2), "gagne"
         else:
             retour, verdict = 0.0, "perdu"
-        gain = round(retour - b["mise"], 2)
-        emoji = {"gagne": "✅", "perdu": "❌", "rembourse": "↩️"}[verdict]
-        publish("result", f"{emoji} {b['cheval']} : {verdict} ({gain:+.2f} €)",
-                {"bet_id": b["id"], "statut": verdict, "retour": retour, "gain": gain, "rapport": rapport,
-                 "place": me.get("ordreArrivee"), "arrivee": arrivee}, priority=4)
-        b["statut"] = verdict
-        log.append(f"resultat {b['id']} : {verdict}")
+        ready.setdefault(b.get("groupe", b["id"]), []).append((b, {
+            "bet_id": b["id"], "statut": verdict, "retour": retour, "gain": round(retour - b["mise"], 2),
+            "rapport": rapport, "place": me.get("ordreArrivee"), "arrivee": arrivee}))
+    for group, items in ready.items():
+        mise = sum(b["mise"] for b, _ in items)
+        retour = round(sum(r["retour"] for _, r in items), 2)
+        payes = sum(r["statut"] == "gagne" for _, r in items)
+        b0 = items[0][0]
+        emoji = "✅" if retour > mise else ("↩️" if retour == mise else "❌")
+        for i, (b, r) in enumerate(items):
+            last = i == len(items) - 1
+            title = (f"{emoji} {b0['course']} {b0['hippodrome']} : {payes}/{len(items)} placés · "
+                     f"{retour:.2f} € pour {mise:.0f} € ({retour - mise:+.2f} €)") if last else f"{b['cheval']} : {r['statut']}"
+            publish("result", title, {**r, **({} if last else {"silent": True})}, priority=4 if last else 1)
+            b["statut"] = r["statut"]
+            log.append(f"resultat {b['id']} : {r['statut']}")
     return log
 
 
@@ -559,11 +645,12 @@ def main(mode):
     if mode == "candidates":
         print(json.dumps(candidates(d, 5, 360), ensure_ascii=False, indent=1))
         return
-    bets, quinte, chat, model, boxes = state()
+    bets, quinte, chat, model, boxes, plan = state()
     log = []
     for name, fn in (("chat", lambda: step_chats(d, bets, quinte, chat, boxes)),
                      ("resultats", lambda: step_results(d, bets)),
-                     ("pari", lambda: step_bet(d, bets) if mode == "tick" else "-"),
+                     ("plan", lambda: step_plan(d, plan, bets) if mode == "tick" else "-"),
+                     ("pari", lambda: step_bet(d, bets, plan) if mode == "tick" else "-"),
                      ("quinte", lambda: step_quinte(d, quinte, model) if mode == "tick" else "-")):
         try:
             log.append(f"{name}: {fn()}")
