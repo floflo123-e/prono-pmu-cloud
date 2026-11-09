@@ -120,6 +120,11 @@ def state():
 
 def publish(kind, title, payload, priority=3, topic=None):
     body = json.dumps({"kind": kind, **payload}, ensure_ascii=False, separators=(",", ":"))
+    # ntfy transforme en piece jointe au-dela de 4 Ko : on raccourcit le texte au lieu d'echouer
+    while len(body.encode()) > 3900 and len(payload.get("text") or "") > 200:
+        over = len(body.encode()) - 3900
+        payload = {**payload, "text": payload["text"][:-max(over // 2, 40)].rstrip() + "…"}
+        body = json.dumps({"kind": kind, **payload}, ensure_ascii=False, separators=(",", ":"))
     if len(body.encode()) > 4000:
         raise ValueError("message trop long")
     title = " ".join(title.split())[:200]
@@ -630,9 +635,13 @@ def step_chat(d, bets, quinte, chat, topic=None):
             ai = "claude"
             prompt = prompt.replace("Tu es Gemini.", "Tu es Claude (Gemini est indisponible, dis-le en une courte phrase).")
     if text is None:
-        text = ask(prompt, system=SYSTEM_CHAT + (" Tu as l'outil WebSearch : si les données PMU ne suffisent pas "
-                   "(pronostics presse, non-partants, résultats, courses étrangères), fais 1 à 2 recherches maximum, "
-                   "puis cite brièvement la source. Les données PMU priment sur internet."), as_json=False, tools="WebSearch")
+        try:
+            text = ask(prompt, system=SYSTEM_CHAT + (" Tu as l'outil WebSearch : si les données PMU ne suffisent pas "
+                       "(pronostics presse, non-partants, résultats, courses étrangères), fais 1 à 2 recherches maximum, "
+                       "puis cite brièvement la source. Les données PMU priment sur internet."), as_json=False, tools="WebSearch")
+        except Exception as e:  # sans reponse, la question serait reposee a chaque passage
+            print(f"chat: {e}")
+            text = "Désolé, je n'ai pas pu répondre cette fois (erreur du serveur). Repose ta question dans une minute."
     publish("chat_a", f"💬 {'Gemini' if ai == 'gemini' else 'Claude'} : " + text[:80],
             {"reply_to": last["id"], "text": text[:3500], "ai": ai, "ts": int(now().timestamp() * 1000)}, priority=4, topic=topic)
     return f"reponse envoyee ({ai})"
