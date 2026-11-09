@@ -39,6 +39,13 @@ SYSTEM = "Tu es Claude, le conseiller hippique personnel de l'utilisateur dans s
 SYSTEM_CHAT = ("Tu es Claude, le conseiller hippique personnel de l'utilisateur dans son appli Prono PMU. "
                "Réponds en français simple, tutoiement, phrases courtes, sans markdown lourd. Sois honnête : "
                "aucun pari n'est sûr, rappelle-le quand c'est utile, sans faire la morale à chaque message.")
+WEB_CHAT = (" Tu as WebSearch et WebFetch : sers-t'en vraiment, comme un turfiste sérieux. Dès que la question porte "
+            "sur une course, un cheval ou un pari, fais 3 à 6 recherches (pronostics de la presse : Paris-Turf, Equidia, "
+            "Geny, Zone-Turf, Turfomania, Tierce Magazine ; non-partants ; forme récente, musique, jockey/driver, "
+            "entraîneur, terrain, déferrage) et ouvre avec WebFetch 1 à 3 pages utiles pour lire les vrais pronos. "
+            "Croise avec les données PMU fournies (cotes, probabilités), qui priment en cas de conflit. Dans ta réponse, "
+            "dis brièvement ce que disent les pronostiqueurs (consensus ou non) et cite tes sources par leur nom. "
+            "Pour une simple discussion sans course, ne cherche pas. Reste concis : le message est lu sur un téléphone.")
 
 S = requests.Session()
 S.headers["User-Agent"] = "Mozilla/5.0 prono-pmu-cloud/1.0 usage-personnel"
@@ -141,10 +148,10 @@ def claude_bin():
     return "claude"
 
 
-def ask(prompt, system=SYSTEM, as_json=True, tools=""):
-    extra = ["--allowedTools", tools, "--max-turns", "6"] if tools else []
+def ask(prompt, system=SYSTEM, as_json=True, tools="", turns=6):
+    extra = ["--allowedTools", tools, "--max-turns", str(turns)] if tools else []
     out = subprocess.run([claude_bin(), "-p", "--output-format", "json", "--tools", tools, *extra, "--system-prompt", system],
-                         input=prompt, capture_output=True, text=True, timeout=300)
+                         input=prompt, capture_output=True, text=True, timeout=420)
     if out.returncode != 0:
         raise RuntimeError(out.stderr[-400:] or out.stdout[-400:])
     text = json.loads(out.stdout).get("result", "")
@@ -636,9 +643,7 @@ def step_chat(d, bets, quinte, chat, topic=None):
             prompt = prompt.replace("Tu es Gemini.", "Tu es Claude (Gemini est indisponible, dis-le en une courte phrase).")
     if text is None:
         try:
-            text = ask(prompt, system=SYSTEM_CHAT + (" Tu as l'outil WebSearch : si les données PMU ne suffisent pas "
-                       "(pronostics presse, non-partants, résultats, courses étrangères), fais 1 à 2 recherches maximum, "
-                       "puis cite brièvement la source. Les données PMU priment sur internet."), as_json=False, tools="WebSearch")
+            text = ask(prompt, system=SYSTEM_CHAT + WEB_CHAT, as_json=False, tools="WebSearch,WebFetch", turns=16)
         except Exception as e:  # sans reponse, la question serait reposee a chaque passage
             print(f"chat: {e}")
             text = "Désolé, je n'ai pas pu répondre cette fois (erreur du serveur). Repose ta question dans une minute."
