@@ -608,7 +608,9 @@ def step_chat(d, bets, quinte, chat, topic=None):
     who = lambda m: "Utilisateur" if m["kind"] == "chat_q" else ("Gemini" if m.get("ai") == "gemini" else "Claude")
     # « Effacer le chat » dans l'appli : on oublie tout ce qui precede (since = ms)
     since = max(now().timestamp() - 12 * 3600, (last.get("since") or 0) / 1000)
-    history = [m for m in chat if m.get("time", 0) > since][-24:]
+    drop = set(last.get("drop") or [])  # messages supprimes un par un dans l'appli
+    gone = lambda m: (m.get("id") if m.get("kind") == "chat_q" else "a:" + str(m.get("reply_to"))) in drop
+    history = [m for m in chat if m.get("time", 0) > since and not gone(m)][-24:]
     lines = [f"{who(m)} : {m.get('text', '')}" for m in history]
     # ntfy ne garde que 12 h : l'appli joint les derniers messages qu'elle a en memoire
     earlier = [f"{'Utilisateur' if h.get('u') else h.get('ai', 'Claude').capitalize()} : {h.get('t', '')}"
