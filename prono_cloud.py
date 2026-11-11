@@ -464,7 +464,8 @@ Partants : numéro, nom, cote, musique, jockey/driver, entraîneur, gains de car
 {data}
 
 Donne TON pronostic final de 5 chevaux (ordre de préférence). Français simple, tutoiement, honnête sur l'incertitude.
-Réponds UNIQUEMENT avec : {{"selection": [n1,n2,n3,n4,n5], "base": <n>, "outsider": <n>, "pourquoi": "<3 à 5 phrases>", "confiance": "<faible|moyenne|bonne>"}}"""
+Propose aussi un pari 2 sur 4 (2 chevaux qui doivent finir tous les deux dans les 4 premiers, ordre indifférent) : les 2 chevaux les plus sûrs d'être dans les 4.
+Réponds UNIQUEMENT avec : {{"selection": [n1,n2,n3,n4,n5], "base": <n>, "outsider": <n>, "deux_sur_quatre": [a,b], "pourquoi_2sur4": "<1 phrase>", "pourquoi": "<3 à 5 phrases>", "confiance": "<faible|moyenne|bonne>"}}"""
 
 
 def step_quinte(d, quinte, model):
@@ -489,8 +490,11 @@ def step_quinte(d, quinte, model):
              "course": f"R{r}C{c}", "depart": start_of(course).strftime("%H:%M"), "depart_ts": course["heureDepart"],
              "selection": adv.get("selection"), "base": adv.get("base"), "outsider": adv.get("outsider"),
              "pourquoi": adv.get("pourquoi"), "confiance": adv.get("confiance"),
+             "deux_sur_quatre": adv.get("deux_sur_quatre"), "pourquoi_2sur4": adv.get("pourquoi_2sur4"),
              "modele": (model or {}).get("pronostics"), "maj_le": t.strftime("%H:%M"), "cree_ts": int(t.timestamp() * 1000)}
         sel = "-".join(str(x) for x in q["selection"] or [])
+        if q["deux_sur_quatre"]:
+            sel += " · 2/4 " + "-".join(str(x) for x in q["deux_sur_quatre"])
         publish("quinte", f"⏰ Quinté+ dans {mins} min · {sel} · {q['course']} {q['hippodrome']} {q['depart']}", {"quinte": q}, priority=5)
         return f"quinte publie : {sel}"
     return "pas de quinte dans la fenetre"
