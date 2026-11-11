@@ -31,10 +31,10 @@ STAKE = 2.0                 # 2 EUR par cheval
 TAKE_PLACE = 0.18
 MIN_RAPPORT = 1.10
 HORSES_PER_RACE = 4         # 4 chevaux en simple place par course
-MIN_P_TOP = 0.74            # course retenue si un cheval depasse 74 % d'etre place (pas de limite par jour)
+MIN_P_TOP = 0.75            # course retenue si un cheval a 75 % ou plus d'etre place (pas de limite par jour)
 SCAN_AHEAD = 180            # on regarde les courses des 3 prochaines heures a chaque passage
-AFTERNOON = (10, 20)        # departs entre 10h et 20h (heure de Paris)
-PLAN_FROM_HOUR = 8          # recherche des courses des 8h (avant les courses de 10h)
+AFTERNOON = (11, 20)        # departs entre 11h et 20h (heure de Paris)
+PLAN_FROM_HOUR = 8          # recherche des courses des 8h (avant les courses de 11h)
 WINDOW = (25, 44)           # conseil final 25-44 min avant le depart (1 seul rappel cote appli)
 SYSTEM = "Tu es Claude, le conseiller hippique personnel de l'utilisateur dans son appli Prono PMU. Réponds uniquement en JSON."
 SYSTEM_CHAT = ("Tu es Claude, le conseiller hippique personnel de l'utilisateur dans son appli Prono PMU. "
@@ -317,7 +317,7 @@ def minutes_until(hour):
 
 
 def step_plan(d, plan, bets):
-    """Toutes les 10 min (8h-20h) : ajoute chaque course francaise 10h-20h ou un cheval depasse 74 % d'etre place."""
+    """Toutes les 10 min (8h-20h) : ajoute chaque course francaise 11h-20h ou un cheval a 75 % ou plus d'etre place."""
     if not (PLAN_FROM_HOUR <= now().hour < AFTERNOON[1]):
         return f"plan : {', '.join(p['course'] + ' ' + p['depart'] for p in plan) or '-'}"
     bet_on = {b["course"] for b in bets.values()}
@@ -331,7 +331,7 @@ def step_plan(d, plan, bets):
         taken = {p["course"] for p in plan} | bet_on
         for c in candidates(d, lo, hi, max_races=60, top=HORSES_PER_RACE):
             p_top = max((h.get("p_place", 0) for h in c["chevaux"]), default=0)
-            if c["chevaux_payes_en_place"] == 3 and c["course"] not in taken and p_top > MIN_P_TOP:
+            if c["chevaux_payes_en_place"] == 3 and c["course"] not in taken and p_top >= MIN_P_TOP:
                 add.append({"course": c["course"], "r": c["r"], "c": c["c"], "hippodrome": c["hippodrome"],
                             "depart": c["depart"], "depart_ts": c["depart_ts"], "score": score4(c),
                             "p_top": round(p_top, 3)})
