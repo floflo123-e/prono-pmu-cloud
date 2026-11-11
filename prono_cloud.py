@@ -31,9 +31,10 @@ STAKE = 2.0                 # 2 EUR par cheval
 TAKE_PLACE = 0.18
 MIN_RAPPORT = 1.10
 HORSES_PER_RACE = 4         # 4 chevaux en simple place par course
-RACES_PER_DAY = 3           # 3 courses par jour
+MIN_P_TOP = 0.74            # course retenue si un cheval depasse 74 % d'etre place (pas de limite par jour)
+SCAN_AHEAD = 180            # on regarde les courses des 3 prochaines heures a chaque passage
 AFTERNOON = (10, 20)        # departs entre 10h et 20h (heure de Paris)
-PLAN_FROM_HOUR = 8          # choix des 3 courses des 8h (avant les courses de 10h)
+PLAN_FROM_HOUR = 8          # recherche des courses des 8h (avant les courses de 10h)
 WINDOW = (25, 44)           # conseil final 25-44 min avant le depart (1 seul rappel cote appli)
 SYSTEM = "Tu es Claude, le conseiller hippique personnel de l'utilisateur dans son appli Prono PMU. Réponds uniquement en JSON."
 SYSTEM_CHAT = ("Tu es Claude, le conseiller hippique personnel de l'utilisateur dans son appli Prono PMU. "
@@ -316,24 +317,29 @@ def minutes_until(hour):
 
 
 def step_plan(d, plan, bets):
-    """Des 8h : choisit les 3 courses de la journee (10h-20h) ou 4 favoris ont le plus de chances d'etre payes."""
-    if len(plan) >= RACES_PER_DAY or not (PLAN_FROM_HOUR <= now().hour < AFTERNOON[1]):
+    """Toutes les 10 min (8h-20h) : ajoute chaque course francaise 10h-20h ou un cheval depasse 74 % d'etre place."""
+    if not (PLAN_FROM_HOUR <= now().hour < AFTERNOON[1]):
         return f"plan : {', '.join(p['course'] + ' ' + p['depart'] for p in plan) or '-'}"
-    lo, hi = max(WINDOW[0], minutes_until(AFTERNOON[0])), minutes_until(AFTERNOON[1])
-    if hi <= lo:
-        return "plus de course aujourd'hui"
-    taken = {p["course"] for p in plan} | {b["course"] for b in bets.values()}
-    races_ = [c for c in candidates(d, lo, hi, max_races=60, top=HORSES_PER_RACE)
-              if c["chevaux_payes_en_place"] == 3 and c["course"] not in taken]
-    races_.sort(key=lambda c: -score4(c))
-    add = [{"course": c["course"], "r": c["r"], "c": c["c"], "hippodrome": c["hippodrome"],
-            "depart": c["depart"], "depart_ts": c["depart_ts"], "score": score4(c)}
-           for c in races_[:RACES_PER_DAY - len(plan)]]
-    if not add:
-        return "aucune course de 8 partants ou plus aujourd'hui"
+    bet_on = {b["course"] for b in bets.values()}
+    # anciennes courses choisies avec la regle d'avant (sans p_top) et pas encore jouees : retirees
+    old = [p for p in plan if "p_top" not in p and p["course"] not in bet_on]
+    plan[:] = [p for p in plan if p not in old]
+    lo = max(WINDOW[0], minutes_until(AFTERNOON[0]))
+    hi = min(minutes_until(AFTERNOON[1]), SCAN_AHEAD)
+    add = []
+    if hi > lo:
+        taken = {p["course"] for p in plan} | bet_on
+        for c in candidates(d, lo, hi, max_races=60, top=HORSES_PER_RACE):
+            p_top = max((h.get("p_place", 0) for h in c["chevaux"]), default=0)
+            if c["chevaux_payes_en_place"] == 3 and c["course"] not in taken and p_top > MIN_P_TOP:
+                add.append({"course": c["course"], "r": c["r"], "c": c["c"], "hippodrome": c["hippodrome"],
+                            "depart": c["depart"], "depart_ts": c["depart_ts"], "score": score4(c),
+                            "p_top": round(p_top, 3)})
+    if not add and not old:
+        return f"rien de nouveau ; plan : {', '.join(p['course'] + ' ' + p['depart'] for p in plan) or '-'}"
     plan[:] = sorted(plan + add, key=lambda p: p["depart_ts"])
     publish("plan", "Courses du jour choisies", {"date": d.isoformat(), "courses": plan, "silent": True}, priority=1)
-    return f"plan publie : {', '.join(p['course'] + ' ' + p['depart'] for p in plan)}"
+    return f"plan publie : {', '.join(p['course'] + ' ' + p['depart'] for p in plan) or '-'}"
 
 
 def find_race(d, r, c):
