@@ -31,9 +31,9 @@ STAKE = 2.0                 # 2 EUR par cheval
 TAKE_PLACE = 0.18
 MIN_RAPPORT = 1.10
 HORSES_PER_RACE = 4         # 4 chevaux en simple place par course
-RACES_PER_DAY = 3           # 3 courses chaque apres-midi
-AFTERNOON = (13, 20)        # departs entre 13h et 20h (heure de Paris)
-PLAN_FROM_HOUR = 11         # choix des 3 courses a partir de 11h
+RACES_PER_DAY = 3           # 3 courses par jour
+AFTERNOON = (10, 20)        # departs entre 10h et 20h (heure de Paris)
+PLAN_FROM_HOUR = 8          # choix des 3 courses des 8h (avant les courses de 10h)
 WINDOW = (25, 44)           # conseil final 25-44 min avant le depart (1 seul rappel cote appli)
 SYSTEM = "Tu es Claude, le conseiller hippique personnel de l'utilisateur dans son appli Prono PMU. Réponds uniquement en JSON."
 SYSTEM_CHAT = ("Tu es Claude, le conseiller hippique personnel de l'utilisateur dans son appli Prono PMU. "
@@ -316,12 +316,12 @@ def minutes_until(hour):
 
 
 def step_plan(d, plan, bets):
-    """Vers 11h : choisit les 3 courses de l'apres-midi ou 4 favoris ont le plus de chances d'etre payes."""
+    """Des 8h : choisit les 3 courses de la journee (10h-20h) ou 4 favoris ont le plus de chances d'etre payes."""
     if len(plan) >= RACES_PER_DAY or not (PLAN_FROM_HOUR <= now().hour < AFTERNOON[1]):
         return f"plan : {', '.join(p['course'] + ' ' + p['depart'] for p in plan) or '-'}"
     lo, hi = max(WINDOW[0], minutes_until(AFTERNOON[0])), minutes_until(AFTERNOON[1])
     if hi <= lo:
-        return "plus de course cet apres-midi"
+        return "plus de course aujourd'hui"
     taken = {p["course"] for p in plan} | {b["course"] for b in bets.values()}
     races_ = [c for c in candidates(d, lo, hi, max_races=60, top=HORSES_PER_RACE)
               if c["chevaux_payes_en_place"] == 3 and c["course"] not in taken]
@@ -330,9 +330,9 @@ def step_plan(d, plan, bets):
             "depart": c["depart"], "depart_ts": c["depart_ts"], "score": score4(c)}
            for c in races_[:RACES_PER_DAY - len(plan)]]
     if not add:
-        return "aucune course de 8 partants ou plus cet apres-midi"
+        return "aucune course de 8 partants ou plus aujourd'hui"
     plan[:] = sorted(plan + add, key=lambda p: p["depart_ts"])
-    publish("plan", "Courses de l'après-midi choisies", {"date": d.isoformat(), "courses": plan, "silent": True}, priority=1)
+    publish("plan", "Courses du jour choisies", {"date": d.isoformat(), "courses": plan, "silent": True}, priority=1)
     return f"plan publie : {', '.join(p['course'] + ' ' + p['depart'] for p in plan)}"
 
 
